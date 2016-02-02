@@ -2,8 +2,10 @@ package aws
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/terraform"
@@ -256,6 +258,113 @@ func TestAccAWSRoute53Record_TypeChange(t *testing.T) {
 			},
 		},
 	})
+}
+
+// Test record deletion out of band and make sure we render a new plan
+// Part of regression test(s) for https://github.com/hashicorp/terraform/pull/4892
+func TestAccAWSRoute53Record_planUpdate(t *testing.T) {
+	var zone route53.GetHostedZoneOutput
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckRoute53RecordDestroy,
+		Steps: []resource.TestStep{
+			resource.TestStep{
+				Config: testAccRoute53RecordConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckRoute53RecordExists("aws_route53_record.default"),
+					testAccCheckRoute53ZoneExists("aws_route53_zone.main", &zone),
+					testAccCheckRoute53DeleteRecord("aws_route53_record.default", &zone),
+				),
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+func testAccCheckRoute53DeleteRecord(n string, zone *route53.GetHostedZoneOutput) resource.TestCheckFunc {
+	// This is a hardcoded representation of the recordset created in testAccRoute53RecordConfig
+	rec := &route53.ResourceRecordSet{
+		Name: aws.String("www.notexample.com."),
+		ResourceRecords: []*route53.ResourceRecord{
+			&route53.ResourceRecord{
+				Value: aws.String("127.0.0.27"),
+			},
+			&route53.ResourceRecord{
+				Value: aws.String("127.0.0.1"),
+			},
+		},
+		TTL:  aws.Int64(int64(30)),
+		Type: aws.String("A"),
+	}
+	return func(s *terraform.State) error {
+		conn := testAccProvider.Meta().(*AWSClient).r53conn
+		rs, ok := s.RootModule().Resources[n]
+		if !ok {
+			return fmt.Errorf("Not found: %s", n)
+		}
+
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("No hosted zone ID is set")
+		}
+		// clean hosted zone id
+		if zone.HostedZone == nil || zone.HostedZone.Id == nil {
+			return fmt.Errorf("Error with provided Zone, no id found: %s", zone)
+		}
+
+		// Destroy the record
+		changeBatch := &route53.ChangeBatch{
+			Comment: aws.String("Deleted by Terraform"),
+			Changes: []*route53.Change{
+				&route53.Change{
+					Action:            aws.String("DELETE"),
+					ResourceRecordSet: rec,
+				},
+			},
+		}
+
+		zone_id := cleanZoneID(*zone.HostedZone.Id)
+
+		req := &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(cleanZoneID(zone_id)),
+			ChangeBatch:  changeBatch,
+		}
+
+		wait := resource.StateChangeConf{
+			Pending:    []string{"rejected"},
+			Target:     []string{"accepted"},
+			Timeout:    5 * time.Minute,
+			MinTimeout: 1 * time.Second,
+			Refresh: func() (interface{}, string, error) {
+				_, err := conn.ChangeResourceRecordSets(req)
+				if err != nil {
+					log.Printf("\n---\nDelete error: %s\n---\n", err)
+					if r53err, ok := err.(awserr.Error); ok {
+						if r53err.Code() == "PriorRequestNotComplete" {
+							// There is some pending operation, so just retry
+							// in a bit.
+							return 42, "rejected", nil
+						}
+
+						if r53err.Code() == "InvalidChangeBatch" {
+							// This means that the record is already gone.
+							return 42, "accepted", nil
+						}
+					}
+
+					return 42, "failure", err
+				}
+
+				return 42, "accepted", nil
+			},
+		}
+
+		if _, err := wait.WaitForState(); err != nil {
+			return fmt.Errorf("Error waiting for route53 record to delete: %s", err)
+		}
+
+		return nil
+	}
 }
 
 func testAccCheckRoute53RecordDestroy(s *terraform.State) error {
